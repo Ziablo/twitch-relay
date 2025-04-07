@@ -20,6 +20,22 @@ if (!fs.existsSync(path.join(__dirname, 'public'))) {
 
 // Variable pour suivre l'état du stream
 let currentStream = null;
+let streamLogs = [];
+
+// Fonction pour ajouter un log
+function addLog(message, isError = false) {
+    const logEntry = {
+        timestamp: new Date().toISOString(),
+        message,
+        isError
+    };
+    streamLogs.push(logEntry);
+    // Limiter à 100 entrées
+    if (streamLogs.length > 100) {
+        streamLogs.shift();
+    }
+    console.log(`${isError ? '[ERREUR]' : '[INFO]'} ${message}`);
+}
 
 // Télécharger et analyser le contenu M3U8
 function downloadM3U8(url) {
@@ -49,12 +65,12 @@ function downloadM3U8(url) {
 // Fonction pour trouver la meilleure qualité dans un fichier M3U8
 async function findBestQualityStream(m3u8Url) {
     try {
-        console.log(`Analyse du fichier M3U8: ${m3u8Url}`);
+        addLog(`Analyse du fichier M3U8: ${m3u8Url}`);
         const content = await downloadM3U8(m3u8Url);
         
         // Vérifions si c'est un manifest principal ou une playlist
         if (content.includes('#EXT-X-STREAM-INF')) {
-            console.log('Master playlist détectée, recherche du flux de meilleure qualité');
+            addLog('Master playlist détectée, recherche du flux de meilleure qualité');
             
             // Trouver toutes les résolutions disponibles
             const lines = content.split('\n');
@@ -83,18 +99,30 @@ async function findBestQualityStream(m3u8Url) {
             }
             
             if (bestStreamUrl) {
-                console.log(`Meilleure qualité trouvée: ${bestBandwidth} bps à ${bestStreamUrl}`);
+                addLog(`Meilleure qualité trouvée: ${bestBandwidth} bps à ${bestStreamUrl}`);
                 return bestStreamUrl;
             }
         }
         
         // Si aucun flux de meilleure qualité n'est trouvé ou ce n'est pas un manifest principal
-        console.log('Utilisation de l\'URL M3U8 d\'origine');
+        addLog('Utilisation de l\'URL M3U8 d\'origine');
         return m3u8Url;
     } catch (error) {
-        console.error(`Erreur lors de l'analyse du M3U8: ${error.message}`);
+        addLog(`Erreur lors de l'analyse du M3U8: ${error.message}`, true);
         return m3u8Url;
     }
+}
+
+// Tester si FFmpeg est correctement installé
+function testFfmpeg() {
+    return new Promise((resolve) => {
+        try {
+            const command = ffmpeg().getAvailableCodecs();
+            resolve({ installed: true, message: 'FFmpeg est correctement installé' });
+        } catch (error) {
+            resolve({ installed: false, message: `FFmpeg n'est pas correctement installé: ${error.message}` });
+        }
+    });
 }
 
 // Route principale
@@ -108,36 +136,61 @@ app.get('/', (req, res) => {
     }
 });
 
+// Route pour obtenir les logs
+app.get('/logs', (req, res) => {
+    res.json(streamLogs);
+});
+
 // Route pour configurer et démarrer le stream
 app.post('/start-stream', async (req, res) => {
     const { streamUrl } = req.body;
     
     if (!streamUrl) {
+        addLog('URL du flux manquante', true);
         return res.status(400).json({ error: 'URL du flux manquante' });
     }
 
     // Vérifier la clé de stream Twitch
     if (!process.env.TWITCH_STREAM_KEY) {
+        addLog('Clé de stream Twitch non configurée', true);
         return res.status(500).json({ error: 'Clé de stream Twitch non configurée' });
+    }
+
+    // Test de FFmpeg
+    const ffmpegTest = await testFfmpeg();
+    if (!ffmpegTest.installed) {
+        addLog('FFmpeg non installé correctement', true);
+        return res.status(500).json({ 
+            error: 'FFmpeg non installé correctement',
+            message: ffmpegTest.message
+        });
     }
 
     // Arrêter le stream en cours s'il existe
     if (currentStream) {
         try {
+            addLog('Arrêt du stream en cours...');
             currentStream.kill();
         } catch (error) {
-            console.error('Erreur lors de l\'arrêt du stream en cours:', error);
+            addLog(`Erreur lors de l'arrêt du stream en cours: ${error.message}`, true);
         }
     }
 
     try {
+        // Déterminer si l'URL est un flux Twitch
+        const isTwitchUrl = streamUrl.includes('ttvnw.net') || streamUrl.includes('twitch.tv');
+        
+        if (isTwitchUrl) {
+            addLog('URL Twitch détectée, traitement spécial...');
+        }
+
         // Trouver le meilleur flux de qualité si c'est un M3U8
         const bestQualityUrl = await findBestQualityStream(streamUrl);
         
         // URL de streaming Twitch
         const twitchUrl = `rtmp://live.twitch.tv/app/${process.env.TWITCH_STREAM_KEY}`;
-        console.log('Démarrage du stream vers Twitch...');
-        console.log('URL source:', bestQualityUrl);
+        addLog('Démarrage du stream vers Twitch...');
+        addLog(`URL source: ${bestQualityUrl}`);
         
         // Démarrer le nouveau stream avec des options supplémentaires pour les flux HLS
         currentStream = ffmpeg(bestQualityUrl)
@@ -160,16 +213,17 @@ app.post('/start-stream', async (req, res) => {
             ])
             .output(twitchUrl)
             .on('start', (commandLine) => {
-                console.log('Stream démarré avec la commande:', commandLine);
+                addLog(`Stream démarré avec la commande: ${commandLine}`);
             })
             .on('error', (err, stdout, stderr) => {
-                console.error('Erreur de streaming:', err.message);
-                console.error('stdout:', stdout);
-                console.error('stderr:', stderr);
+                addLog(`Erreur de streaming: ${err.message}`, true);
+                // Ajouter stdout et stderr aux logs pour le débogage
+                if (stdout) addLog(`Sortie standard: ${stdout}`);
+                if (stderr) addLog(`Erreur standard: ${stderr}`);
                 currentStream = null;
             })
             .on('end', () => {
-                console.log('Stream terminé');
+                addLog('Stream terminé');
                 currentStream = null;
             });
         
@@ -182,11 +236,13 @@ app.post('/start-stream', async (req, res) => {
             debug: {
                 originalUrl: streamUrl,
                 bestQualityUrl: bestQualityUrl,
-                ffmpegInstalled: typeof ffmpeg === 'function'
+                isTwitchUrl: isTwitchUrl,
+                ffmpegInstalled: ffmpegTest.installed,
+                ffmpegMessage: ffmpegTest.message
             }
         });
     } catch (error) {
-        console.error('Erreur lors du démarrage du stream:', error);
+        addLog(`Erreur lors du démarrage du stream: ${error.message}`, true);
         res.status(500).json({ 
             error: 'Erreur lors du démarrage du stream',
             message: error.message,
@@ -199,14 +255,16 @@ app.post('/start-stream', async (req, res) => {
 app.post('/stop-stream', (req, res) => {
     if (currentStream) {
         try {
+            addLog('Arrêt du stream...');
             currentStream.kill();
             currentStream = null;
             res.json({ success: true, message: 'Stream arrêté avec succès' });
         } catch (error) {
-            console.error('Erreur lors de l\'arrêt du stream:', error);
+            addLog(`Erreur lors de l'arrêt du stream: ${error.message}`, true);
             res.status(500).json({ error: 'Erreur lors de l\'arrêt du stream', message: error.message });
         }
     } else {
+        addLog('Tentative d\'arrêt mais aucun stream en cours');
         res.json({ success: false, message: 'Aucun stream en cours' });
     }
 });
@@ -215,7 +273,8 @@ app.post('/stop-stream', (req, res) => {
 app.get('/stream-status', (req, res) => {
     res.json({ 
         isStreaming: currentStream !== null,
-        streamUrl: currentStream ? currentStream._inputs[0] : null
+        streamUrl: currentStream ? currentStream._inputs[0] : null,
+        logs: streamLogs.slice(-10) // Retourner les 10 derniers logs
     });
 });
 
@@ -226,5 +285,5 @@ app.get('/health', (req, res) => {
 
 // Démarrage du serveur
 app.listen(port, () => {
-    console.log(`Serveur de streaming démarré sur le port ${port}`);
+    addLog(`Serveur de streaming démarré sur le port ${port}`);
 }); 
