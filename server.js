@@ -2,6 +2,8 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
+const http = require('http');
 require('dotenv').config();
 
 const app = express();
@@ -18,6 +20,82 @@ if (!fs.existsSync(path.join(__dirname, 'public'))) {
 
 // Variable pour suivre l'état du stream
 let currentStream = null;
+
+// Télécharger et analyser le contenu M3U8
+function downloadM3U8(url) {
+    return new Promise((resolve, reject) => {
+        const protocol = url.startsWith('https') ? https : http;
+        
+        protocol.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                return reject(new Error(`Échec de téléchargement: ${response.statusCode}`));
+            }
+            
+            let data = '';
+            response.on('data', (chunk) => {
+                data += chunk;
+            });
+            
+            response.on('end', () => {
+                resolve(data);
+            });
+            
+        }).on('error', (err) => {
+            reject(err);
+        });
+    });
+}
+
+// Fonction pour trouver la meilleure qualité dans un fichier M3U8
+async function findBestQualityStream(m3u8Url) {
+    try {
+        console.log(`Analyse du fichier M3U8: ${m3u8Url}`);
+        const content = await downloadM3U8(m3u8Url);
+        
+        // Vérifions si c'est un manifest principal ou une playlist
+        if (content.includes('#EXT-X-STREAM-INF')) {
+            console.log('Master playlist détectée, recherche du flux de meilleure qualité');
+            
+            // Trouver toutes les résolutions disponibles
+            const lines = content.split('\n');
+            let bestBandwidth = 0;
+            let bestStreamUrl = '';
+            
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].includes('#EXT-X-STREAM-INF')) {
+                    const bandwidthMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+                    if (bandwidthMatch && parseInt(bandwidthMatch[1]) > bestBandwidth) {
+                        bestBandwidth = parseInt(bandwidthMatch[1]);
+                        // La ligne suivante devrait être l'URL
+                        if (i + 1 < lines.length) {
+                            let streamUrl = lines[i + 1].trim();
+                            
+                            // Si l'URL est relative, la convertir en absolue
+                            if (!streamUrl.startsWith('http')) {
+                                const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+                                streamUrl = baseUrl + streamUrl;
+                            }
+                            
+                            bestStreamUrl = streamUrl;
+                        }
+                    }
+                }
+            }
+            
+            if (bestStreamUrl) {
+                console.log(`Meilleure qualité trouvée: ${bestBandwidth} bps à ${bestStreamUrl}`);
+                return bestStreamUrl;
+            }
+        }
+        
+        // Si aucun flux de meilleure qualité n'est trouvé ou ce n'est pas un manifest principal
+        console.log('Utilisation de l\'URL M3U8 d\'origine');
+        return m3u8Url;
+    } catch (error) {
+        console.error(`Erreur lors de l'analyse du M3U8: ${error.message}`);
+        return m3u8Url;
+    }
+}
 
 // Route principale
 app.get('/', (req, res) => {
@@ -53,20 +131,32 @@ app.post('/start-stream', async (req, res) => {
     }
 
     try {
+        // Trouver le meilleur flux de qualité si c'est un M3U8
+        const bestQualityUrl = await findBestQualityStream(streamUrl);
+        
         // URL de streaming Twitch
         const twitchUrl = `rtmp://live.twitch.tv/app/${process.env.TWITCH_STREAM_KEY}`;
         console.log('Démarrage du stream vers Twitch...');
-        console.log('URL source:', streamUrl);
+        console.log('URL source:', bestQualityUrl);
         
-        // Démarrer le nouveau stream
-        currentStream = ffmpeg(streamUrl)
-            .inputOptions(['-re'])
+        // Démarrer le nouveau stream avec des options supplémentaires pour les flux HLS
+        currentStream = ffmpeg(bestQualityUrl)
+            .inputOptions([
+                '-re',              // Lire à vitesse normale
+                '-analyzeduration 10M', // Augmenter le temps d'analyse
+                '-probesize 10M',   // Augmenter la taille d'analyse
+                '-fflags +genpts+discardcorrupt', // Gérer les erreurs
+                '-reconnect 1',     // Reconnexion automatique
+                '-reconnect_streamed 1',
+                '-reconnect_delay_max 5'
+            ])
             .outputOptions([
-                '-c:v copy',
-                '-c:a aac',
-                '-ar 44100',
-                '-b:a 128k',
-                '-f flv'
+                '-c:v copy',        // Copier le codec vidéo
+                '-c:a aac',         // Convertir l'audio en AAC
+                '-ar 44100',        // Fréquence d'échantillonnage
+                '-b:a 128k',        // Bitrate audio
+                '-f flv',           // Format de sortie
+                '-max_muxing_queue_size 9999' // File d'attente plus grande
             ])
             .output(twitchUrl)
             .on('start', (commandLine) => {
@@ -90,7 +180,8 @@ app.post('/start-stream', async (req, res) => {
             success: true, 
             message: 'Stream démarré avec succès',
             debug: {
-                streamUrl: streamUrl,
+                originalUrl: streamUrl,
+                bestQualityUrl: bestQualityUrl,
                 ffmpegInstalled: typeof ffmpeg === 'function'
             }
         });
