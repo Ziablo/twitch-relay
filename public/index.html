@@ -56,6 +56,24 @@
         button.stop:hover {
             background-color: #c82333;
         }
+        .logs {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .debug-info {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
@@ -71,11 +89,32 @@
             <button onclick="startStream()">Démarrer le Stream</button>
             <button class="stop" onclick="stopStream()">Arrêter le Stream</button>
         </div>
+
+        <div class="debug-info" id="debugInfo">
+            <h3>Informations de débogage</h3>
+            <div id="debugContent">Aucune information disponible</div>
+        </div>
+
+        <div class="logs" id="logs">
+            <h3>Logs</h3>
+            <div id="logsContent"></div>
+        </div>
     </div>
 
     <script>
+        // Fonction pour ajouter un log
+        function addLog(message, isError = false) {
+            const logsContent = document.getElementById('logsContent');
+            const logEntry = document.createElement('div');
+            logEntry.style.color = isError ? 'red' : 'black';
+            logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logsContent.appendChild(logEntry);
+            logsContent.scrollTop = logsContent.scrollHeight;
+        }
+
         async function updateStatus() {
             try {
+                addLog('Mise à jour du statut...');
                 const response = await fetch('/stream-status');
                 const data = await response.json();
                 const statusDiv = document.getElementById('status');
@@ -83,12 +122,15 @@
                 if (data.isStreaming) {
                     statusDiv.className = 'status streaming';
                     statusDiv.textContent = `Statut: En direct - ${data.streamUrl}`;
+                    addLog('Stream actif: ' + data.streamUrl);
                 } else {
                     statusDiv.className = 'status stopped';
                     statusDiv.textContent = 'Statut: Arrêté';
+                    addLog('Stream arrêté');
                 }
             } catch (error) {
                 console.error('Erreur lors de la mise à jour du statut:', error);
+                addLog('Erreur lors de la mise à jour du statut: ' + error.message, true);
             }
         }
 
@@ -96,8 +138,12 @@
             const streamUrl = document.getElementById('streamUrl').value;
             if (!streamUrl) {
                 alert('Veuillez entrer une URL de flux');
+                addLog('Erreur: URL de flux manquante', true);
                 return;
             }
+
+            addLog('Démarrage du stream avec URL: ' + streamUrl);
+            document.getElementById('debugContent').textContent = 'Démarrage du stream...';
 
             try {
                 const response = await fetch('/start-stream', {
@@ -108,35 +154,60 @@
                     body: JSON.stringify({ streamUrl })
                 });
                 const data = await response.json();
+                
                 if (data.success) {
+                    addLog('Stream démarré avec succès');
                     updateStatus();
+                    
+                    // Afficher les infos de débogage
+                    if (data.debug) {
+                        const debugInfo = JSON.stringify(data.debug, null, 2);
+                        document.getElementById('debugContent').innerHTML = '<pre>' + debugInfo + '</pre>';
+                        addLog('Informations de débogage mises à jour');
+                    }
                 } else {
+                    addLog('Erreur: ' + (data.error || 'Échec du démarrage du stream'), true);
                     alert(data.error || 'Erreur lors du démarrage du stream');
+                    document.getElementById('debugContent').textContent = JSON.stringify(data, null, 2);
                 }
             } catch (error) {
                 console.error('Erreur:', error);
+                addLog('Erreur lors de la connexion au serveur: ' + error.message, true);
                 alert('Erreur lors du démarrage du stream');
+                document.getElementById('debugContent').textContent = 'Erreur: ' + error.message;
             }
         }
 
         async function stopStream() {
+            addLog('Arrêt du stream...');
+            
             try {
                 const response = await fetch('/stop-stream', {
                     method: 'POST'
                 });
                 const data = await response.json();
                 if (data.success) {
+                    addLog('Stream arrêté avec succès');
                     updateStatus();
+                    document.getElementById('debugContent').textContent = 'Stream arrêté';
+                } else {
+                    addLog('Avertissement: ' + data.message);
                 }
             } catch (error) {
                 console.error('Erreur:', error);
+                addLog('Erreur lors de l\'arrêt du stream: ' + error.message, true);
                 alert('Erreur lors de l\'arrêt du stream');
             }
         }
 
         // Mettre à jour le statut toutes les 5 secondes
         setInterval(updateStatus, 5000);
-        updateStatus();
+        
+        // Initialisation
+        window.onload = function() {
+            addLog('Application chargée');
+            updateStatus();
+        }
     </script>
 </body>
 </html> 
